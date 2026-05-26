@@ -1,6 +1,12 @@
 import SwiftUI
 import WebKit
 
+final class RunContextWKWebView: WKWebView {
+    override var inputAccessoryView: UIView? {
+        nil
+    }
+}
+
 struct RunContextWebView: UIViewRepresentable {
     var onReady: () -> Void = {}
 
@@ -29,7 +35,7 @@ struct RunContextWebView: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.userContentController = contentController
 
-        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let webView = RunContextWKWebView(frame: .zero, configuration: configuration)
         context.coordinator.webView = webView
         webView.navigationDelegate = context.coordinator
         webView.isOpaque = false
