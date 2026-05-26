@@ -2,8 +2,10 @@ import SwiftUI
 import WebKit
 
 struct RunContextWebView: UIViewRepresentable {
+    var onReady: () -> Void = {}
+
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onReady: onReady)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -58,6 +60,14 @@ struct RunContextWebView: UIViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         weak var webView: WKWebView?
         private let importer = HealthKitRunImporter()
+        private let onReady: () -> Void
+        private let minimumSplashDuration: TimeInterval = 1.5
+        private let startedAt = Date()
+        private var didSignalReady = false
+
+        init(onReady: @escaping () -> Void) {
+            self.onReady = onReady
+        }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             if message.name == "runContextLog" {
@@ -115,7 +125,7 @@ struct RunContextWebView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak webView] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak webView] in
                 guard let webView else { return }
                 webView.evaluateJavaScript("document.body.innerText.trim().length") { result, error in
                     if let error {
@@ -125,7 +135,10 @@ struct RunContextWebView: UIViewRepresentable {
 
                     if let length = result as? Int, length == 0 {
                         self?.loadDiagnosticPage(in: webView, reason: "Vue 화면이 렌더링되지 않았습니다.")
+                        return
                     }
+
+                    self?.signalReadyAfterMinimumDuration()
                 }
             }
         }
@@ -208,6 +221,16 @@ struct RunContextWebView: UIViewRepresentable {
             </html>
             """
             webView.loadHTMLString(html, baseURL: nil)
+        }
+
+        private func signalReadyAfterMinimumDuration() {
+            guard !didSignalReady else { return }
+            didSignalReady = true
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let delay = max(0, minimumSplashDuration - elapsed)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [onReady] in
+                onReady()
+            }
         }
     }
 }

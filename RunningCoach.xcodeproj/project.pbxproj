@@ -260,6 +260,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = PACELAB;
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "러닝 기록 코칭을 위해 운동 기록, 거리, 심박 데이터를 읽습니다.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "다음 러닝 준비를 위해 현재 위치의 기상정보를 확인합니다.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -307,6 +308,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = PACELAB;
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "러닝 기록 코칭을 위해 운동 기록, 거리, 심박 데이터를 읽습니다.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "다음 러닝 준비를 위해 현재 위치의 기상정보를 확인합니다.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
