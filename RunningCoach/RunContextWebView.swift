@@ -11,6 +11,7 @@ struct RunContextWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let contentController = WKUserContentController()
         contentController.add(context.coordinator, name: "runContextHealthKit")
+        contentController.add(context.coordinator, name: "runContextWeatherKit")
         contentController.add(context.coordinator, name: "runContextLog")
         contentController.addUserScript(WKUserScript(
             source: """
@@ -60,6 +61,7 @@ struct RunContextWebView: UIViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         weak var webView: WKWebView?
         private let importer = HealthKitRunImporter()
+        private let weatherImporter = OpenMeteoWeatherImporter()
         private let onReady: () -> Void
         private let minimumSplashDuration: TimeInterval = 1.5
         private let startedAt = Date()
@@ -72,6 +74,11 @@ struct RunContextWebView: UIViewRepresentable {
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             if message.name == "runContextLog" {
                 print("[RunContext WebView]", message.body)
+                return
+            }
+
+            if message.name == "runContextWeatherKit" {
+                handleWeatherMessage(message)
                 return
             }
 
@@ -124,6 +131,33 @@ struct RunContextWebView: UIViewRepresentable {
             }
         }
 
+        private func handleWeatherMessage(_ message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any],
+                  let type = body["type"] as? String else {
+                sendWeatherError("지원하지 않는 날씨 요청입니다.")
+                return
+            }
+
+            guard type == "requestWeatherForecast" else {
+                sendWeatherError("지원하지 않는 날씨 요청입니다.")
+                return
+            }
+
+            print("[RunContext Weather] requestWeatherForecast via Open-Meteo")
+            weatherImporter.fetchForecast { [weak self] result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let snapshot):
+                        print("[RunContext Weather] fetched forecast")
+                        self?.sendWeatherForecast(snapshot)
+                    case .failure(let error):
+                        print("[RunContext Weather] failed:", error.localizedDescription)
+                        self?.sendWeatherError(error.localizedDescription)
+                    }
+                }
+            }
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak webView] in
                 guard let webView else { return }
@@ -171,6 +205,26 @@ struct RunContextWebView: UIViewRepresentable {
             } catch {
                 sendRunUpdateError(externalId: candidate.externalId, message: "HealthKit 갱신 응답 직렬화 실패")
             }
+        }
+
+        private func sendWeatherForecast(_ snapshot: RunContextWeatherSnapshot) {
+            guard let webView else { return }
+            do {
+                let data = try JSONEncoder().encode(snapshot)
+                let json = String(data: data, encoding: .utf8) ?? "{}"
+                webView.evaluateJavaScript("window.RunContextWeatherKit?.receiveForecast(\(json));")
+            } catch {
+                sendWeatherError("날씨 응답 직렬화 실패")
+            }
+        }
+
+        private func sendWeatherError(_ message: String) {
+            guard let webView else { return }
+            let escaped = message
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+                .replacingOccurrences(of: "\n", with: "\\n")
+            webView.evaluateJavaScript("window.RunContextWeatherKit?.receiveError('\(escaped)');")
         }
 
         private func sendError(_ message: String) {
