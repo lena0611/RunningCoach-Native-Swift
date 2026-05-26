@@ -16,6 +16,11 @@ struct HealthKitRunCandidate: Codable {
     let cadence: Double?
     let activeEnergyKcal: Double?
     let temperature: Double?
+    let humidity: Double?
+    let windMps: Double?
+    let elevationGainM: Double?
+    let elevationLossM: Double?
+    let rpe: Double?
     let routeAvailable: Bool
     let laps: [HealthKitLap]
     let fastSegments: [HealthKitFastSegment]
@@ -137,6 +142,11 @@ final class HealthKitRunImporter {
         ].compactMap { HKObjectType.quantityType(forIdentifier: $0) }
             .forEach { types.append($0) }
 
+        if #available(iOS 18.0, *),
+           let effortType = HKObjectType.quantityType(forIdentifier: .workoutEffortScore) {
+            types.append(effortType)
+        }
+
         types.append(HKSeriesType.workoutRoute())
 
         return types
@@ -217,6 +227,7 @@ final class HealthKitRunImporter {
         var routeLocations: [CLLocation] = []
         var distancePoints: [DistancePoint] = []
         var stepPoints: [StepPoint] = []
+        var rpe: Double?
 
         let group = DispatchGroup()
 
@@ -257,7 +268,18 @@ final class HealthKitRunImporter {
             }
         }
 
+        if #available(iOS 18.0, *),
+           let effortType = HKQuantityType.quantityType(forIdentifier: .workoutEffortScore) {
+            group.enter()
+            queryWorkoutEffortScore(for: workout, effortType: effortType) { score in
+                rpe = score
+                group.leave()
+            }
+        }
+
         group.notify(queue: .global()) {
+            let weather = self.workoutWeather(from: workout)
+            let elevation = self.routeElevation(from: routeLocations)
             let avgPace = distanceKm.flatMap { distance -> Double? in
                 guard distance > 0 else { return nil }
                 return durationSec / distance
@@ -288,7 +310,12 @@ final class HealthKitRunImporter {
                     maxHeartRate: maxHeartRate,
                     cadence: avgCadence,
                     activeEnergyKcal: activeEnergy,
-                    temperature: nil,
+                    temperature: weather.temperature,
+                    humidity: weather.humidity,
+                    windMps: nil,
+                    elevationGainM: elevation.gain,
+                    elevationLossM: elevation.loss,
+                    rpe: rpe,
                     routeAvailable: !routeLocations.isEmpty,
                     laps: laps,
                     fastSegments: fastSegments,
@@ -320,6 +347,16 @@ final class HealthKitRunImporter {
             let average = statistics?.averageQuantity().map { Self.rounded($0.doubleValue(for: unit)) }
             let maximum = statistics?.maximumQuantity().map { Self.rounded($0.doubleValue(for: unit)) }
             completion(average, maximum)
+        }
+        healthStore.execute(query)
+    }
+
+    @available(iOS 18.0, *)
+    private func queryWorkoutEffortScore(for workout: HKWorkout, effortType: HKQuantityType, completion: @escaping (Double?) -> Void) {
+        let predicate = HKQuery.predicateForObjects(from: workout)
+        let query = HKStatisticsQuery(quantityType: effortType, quantitySamplePredicate: predicate, options: [.discreteAverage]) { _, statistics, _ in
+            let score = statistics?.averageQuantity().map { Self.rounded($0.doubleValue(for: .appleEffortScore())) }
+            completion(score)
         }
         healthStore.execute(query)
     }
@@ -416,6 +453,43 @@ final class HealthKitRunImporter {
             }
         }
         healthStore.execute(query)
+    }
+
+    private func workoutWeather(from workout: HKWorkout) -> (temperature: Double?, humidity: Double?) {
+        let metadata = workout.metadata ?? [:]
+        let temperature = (metadata[HKMetadataKeyWeatherTemperature] as? HKQuantity)
+            .map { Self.rounded($0.doubleValue(for: .degreeCelsius())) }
+        let humidity = (metadata[HKMetadataKeyWeatherHumidity] as? HKQuantity)
+            .map { Self.normalizedHumidity($0.doubleValue(for: .percent())) }
+        return (temperature, humidity)
+    }
+
+    private func routeElevation(from locations: [CLLocation]) -> (gain: Double?, loss: Double?) {
+        guard locations.count >= 2 else { return (nil, nil) }
+
+        var gain = 0.0
+        var loss = 0.0
+        var previous: CLLocation?
+
+        for location in locations where location.verticalAccuracy >= 0 {
+            guard let last = previous else {
+                previous = location
+                continue
+            }
+
+            let delta = location.altitude - last.altitude
+            previous = location
+            guard abs(delta) >= 0.5, abs(delta) <= 80 else { continue }
+
+            if delta > 0 {
+                gain += delta
+            } else {
+                loss += abs(delta)
+            }
+        }
+
+        guard gain > 0 || loss > 0 else { return (nil, nil) }
+        return (Self.rounded(gain), Self.rounded(loss))
     }
 
     private func buildLaps(
@@ -638,6 +712,11 @@ final class HealthKitRunImporter {
 
     private static func rounded(_ value: Double) -> Double {
         (value * 100).rounded() / 100
+    }
+
+    private static func normalizedHumidity(_ value: Double) -> Double {
+        let percent = value <= 1 ? value * 100 : value
+        return rounded(percent)
     }
 
     private static let dayFormatter: DateFormatter = {
