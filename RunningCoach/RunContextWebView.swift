@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WebKit
 
 final class RunContextWKWebView: WKWebView {
@@ -18,6 +19,7 @@ struct RunContextWebView: UIViewRepresentable {
         let contentController = WKUserContentController()
         contentController.add(context.coordinator, name: "runContextHealthKit")
         contentController.add(context.coordinator, name: "runContextWeatherKit")
+        contentController.add(context.coordinator, name: "runContextHaptics")
         contentController.add(context.coordinator, name: "runContextLog")
         contentController.addUserScript(WKUserScript(
             source: """
@@ -88,6 +90,11 @@ struct RunContextWebView: UIViewRepresentable {
                 return
             }
 
+            if message.name == "runContextHaptics" {
+                handleHapticsMessage(message)
+                return
+            }
+
             guard message.name == "runContextHealthKit" else { return }
             guard let body = message.body as? [String: Any],
                   let type = body["type"] as? String else {
@@ -134,6 +141,24 @@ struct RunContextWebView: UIViewRepresentable {
 
             default:
                 sendError("지원하지 않는 HealthKit 요청입니다.")
+            }
+        }
+
+        private func handleHapticsMessage(_ message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any],
+                  let type = body["type"] as? String else {
+                return
+            }
+
+            switch type {
+            case "selectionChanged":
+                let styleText = body["style"] as? String
+                let style: UIImpactFeedbackGenerator.FeedbackStyle = styleText == "medium" ? .medium : .light
+                let generator = UIImpactFeedbackGenerator(style: style)
+                generator.prepare()
+                generator.impactOccurred(intensity: 0.55)
+            default:
+                return
             }
         }
 
