@@ -1,10 +1,98 @@
 import SwiftUI
 import UIKit
+import UserNotifications
 import WebKit
 
 final class RunContextWKWebView: WKWebView {
     override var inputAccessoryView: UIView? {
         nil
+    }
+}
+
+private struct RunContextNotificationRequest {
+    let id: String
+    let title: String
+    let body: String
+    let date: Date
+
+    nonisolated init?(payload: [String: Any]) {
+        guard let id = payload["id"] as? String,
+              let title = payload["title"] as? String,
+              let body = payload["body"] as? String,
+              let dateIso = payload["dateIso"] as? String,
+              let date = ISO8601DateFormatter().date(from: dateIso) else {
+            return nil
+        }
+        self.id = id
+        self.title = title
+        self.body = body
+        self.date = date
+    }
+}
+
+private final class RunContextNotificationManager {
+    private let notificationPrefix = "pacelab-"
+
+    func syncScheduledNotifications(enabled: Bool, requests: [RunContextNotificationRequest]) {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { [notificationPrefix] pending in
+            let identifiers = pending
+                .map(\.identifier)
+                .filter { $0.hasPrefix(notificationPrefix) }
+            center.removePendingNotificationRequests(withIdentifiers: identifiers)
+
+            guard enabled, !requests.isEmpty else { return }
+            self.requestAuthorization { granted in
+                guard granted else { return }
+                requests.forEach { self.schedule($0) }
+            }
+        }
+    }
+
+    func showImmediateNotification(id: String, title: String, body: String) {
+        requestAuthorization { [weak self] granted in
+            guard granted, let self else { return }
+            let content = self.content(title: title, body: body)
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+            let request = UNNotificationRequest(identifier: self.notificationPrefix + id, content: content, trigger: trigger)
+            UNUserNotificationCenter.current().add(request)
+        }
+    }
+
+    private func schedule(_ request: RunContextNotificationRequest) {
+        let interval = request.date.timeIntervalSinceNow
+        guard interval > 1 else { return }
+        let content = content(title: request.title, body: request.body)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+        let notification = UNNotificationRequest(identifier: notificationPrefix + request.id, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(notification)
+    }
+
+    private func content(title: String, body: String) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.threadIdentifier = "pacelab-training"
+        return content
+    }
+
+    private func requestAuthorization(completion: @escaping (Bool) -> Void) {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                completion(true)
+            case .notDetermined:
+                center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+                    completion(granted)
+                }
+            case .denied:
+                completion(false)
+            @unknown default:
+                completion(false)
+            }
+        }
     }
 }
 
@@ -20,6 +108,7 @@ struct RunContextWebView: UIViewRepresentable {
         contentController.add(context.coordinator, name: "runContextHealthKit")
         contentController.add(context.coordinator, name: "runContextWeatherKit")
         contentController.add(context.coordinator, name: "runContextHaptics")
+        contentController.add(context.coordinator, name: "runContextNotifications")
         contentController.add(context.coordinator, name: "runContextLog")
         contentController.addUserScript(WKUserScript(
             source: """
@@ -66,10 +155,11 @@ struct RunContextWebView: UIViewRepresentable {
         URL(string: "https://lena0611.github.io/RunningCoach/#/")!
     }
 
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, UNUserNotificationCenterDelegate {
         weak var webView: WKWebView?
         private let importer = HealthKitRunImporter()
         private let weatherImporter = OpenMeteoWeatherImporter()
+        private let notificationManager = RunContextNotificationManager()
         private let onReady: () -> Void
         private let minimumSplashDuration: TimeInterval = 1.5
         private let startedAt = Date()
@@ -77,6 +167,8 @@ struct RunContextWebView: UIViewRepresentable {
 
         init(onReady: @escaping () -> Void) {
             self.onReady = onReady
+            super.init()
+            UNUserNotificationCenter.current().delegate = self
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -92,6 +184,11 @@ struct RunContextWebView: UIViewRepresentable {
 
             if message.name == "runContextHaptics" {
                 handleHapticsMessage(message)
+                return
+            }
+
+            if message.name == "runContextNotifications" {
+                handleNotificationMessage(message)
                 return
             }
 
@@ -211,6 +308,39 @@ struct RunContextWebView: UIViewRepresentable {
                     }
                 }
             }
+        }
+
+        private func handleNotificationMessage(_ message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any],
+                  let type = body["type"] as? String else {
+                return
+            }
+
+            switch type {
+            case "syncNotificationSettings":
+                let settings = body["settings"] as? [String: Any] ?? [:]
+                let enabled = settings["allEnabled"] as? Bool ?? false
+                let payloads = body["notifications"] as? [[String: Any]] ?? []
+                let requests = payloads.compactMap(RunContextNotificationRequest.init(payload:))
+                notificationManager.syncScheduledNotifications(enabled: enabled, requests: requests)
+            case "showNotification":
+                guard let title = body["title"] as? String,
+                      let message = body["body"] as? String else {
+                    return
+                }
+                let id = body["id"] as? String ?? "runcontext-now-\(Date().timeIntervalSince1970)"
+                notificationManager.showImmediateNotification(id: id, title: title, body: message)
+            default:
+                return
+            }
+        }
+
+        func userNotificationCenter(
+            _ center: UNUserNotificationCenter,
+            willPresent notification: UNNotification,
+            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+        ) {
+            completionHandler([.banner, .sound, .list])
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
