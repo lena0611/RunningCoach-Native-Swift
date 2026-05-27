@@ -77,6 +77,8 @@ struct HealthKitRunRefreshRequest {
 
 final class HealthKitRunImporter {
     private let healthStore = HKHealthStore()
+    private var runningWorkoutObserverQuery: HKObserverQuery?
+    private var backgroundDeliveryStarted = false
     private struct HeartRatePoint {
         let date: Date
         let bpm: Double
@@ -138,6 +140,26 @@ final class HealthKitRunImporter {
         }
     }
 
+    func startRunningWorkoutBackgroundDelivery(onChange: @escaping () -> Void) {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            print("[RunContext HealthKit] Background delivery unavailable: health data unavailable")
+            return
+        }
+        guard !backgroundDeliveryStarted else { return }
+        backgroundDeliveryStarted = true
+
+        requestAuthorization { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.startRunningWorkoutObserver(onChange: onChange)
+            case .failure(let error):
+                print("[RunContext HealthKit] Background delivery authorization failed:", error.localizedDescription)
+                self.backgroundDeliveryStarted = false
+            }
+        }
+    }
+
     private func requestAuthorization(completion: @escaping (Result<Void, Error>) -> Void) {
         let readTypes = Set(healthTypesToRead())
         healthStore.requestAuthorization(toShare: [], read: readTypes) { success, error in
@@ -174,6 +196,32 @@ final class HealthKitRunImporter {
         types.append(HKSeriesType.workoutRoute())
 
         return types
+    }
+
+    private func startRunningWorkoutObserver(onChange: @escaping () -> Void) {
+        let workoutType = HKObjectType.workoutType()
+        let runningPredicate = HKQuery.predicateForWorkouts(with: .running)
+        let query = HKObserverQuery(sampleType: workoutType, predicate: runningPredicate) { _, completionHandler, error in
+            if let error {
+                print("[RunContext HealthKit] Background workout observer failed:", error.localizedDescription)
+                completionHandler()
+                return
+            }
+
+            print("[RunContext HealthKit] Background running workout change detected")
+            onChange()
+            completionHandler()
+        }
+
+        runningWorkoutObserverQuery = query
+        healthStore.execute(query)
+        healthStore.enableBackgroundDelivery(for: workoutType, frequency: .immediate) { success, error in
+            if let error {
+                print("[RunContext HealthKit] enableBackgroundDelivery failed:", error.localizedDescription)
+                return
+            }
+            print("[RunContext HealthKit] Background delivery \(success ? "enabled" : "not enabled")")
+        }
     }
 
     private func queryRecentRunningWorkouts(days: Int, completion: @escaping (Result<[HealthKitRunCandidate], Error>) -> Void) {

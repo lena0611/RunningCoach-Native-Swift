@@ -30,8 +30,26 @@ private struct RunContextNotificationRequest {
     }
 }
 
+private struct RunContextNotificationSettings {
+    let allEnabled: Bool
+    let healthKitNewRun: Bool
+
+    init(payload: [String: Any]) {
+        allEnabled = payload["allEnabled"] as? Bool ?? false
+        healthKitNewRun = payload["healthKitNewRun"] as? Bool ?? true
+    }
+}
+
 private final class RunContextNotificationManager {
     private let notificationPrefix = "pacelab-"
+    private let settingsKey = "pacelab.notificationSettings"
+
+    func updateSettings(_ settings: RunContextNotificationSettings) {
+        UserDefaults.standard.set([
+            "allEnabled": settings.allEnabled,
+            "healthKitNewRun": settings.healthKitNewRun
+        ], forKey: settingsKey)
+    }
 
     func syncScheduledNotifications(enabled: Bool, requests: [RunContextNotificationRequest]) {
         let center = UNUserNotificationCenter.current()
@@ -57,6 +75,16 @@ private final class RunContextNotificationManager {
             let request = UNNotificationRequest(identifier: self.notificationPrefix + id, content: content, trigger: trigger)
             UNUserNotificationCenter.current().add(request)
         }
+    }
+
+    func showHealthKitDetectedNotificationIfEnabled() {
+        let settings = loadSettings()
+        guard settings.allEnabled, settings.healthKitNewRun else { return }
+        showImmediateNotification(
+            id: "healthkit-detected-\(Date().timeIntervalSince1970)",
+            title: "새 러닝 기록이 감지됐습니다",
+            body: "PaceLAB을 열면 HealthKit 기록을 동기화합니다."
+        )
     }
 
     private func schedule(_ request: RunContextNotificationRequest) {
@@ -93,6 +121,11 @@ private final class RunContextNotificationManager {
                 completion(false)
             }
         }
+    }
+
+    private func loadSettings() -> RunContextNotificationSettings {
+        let payload = UserDefaults.standard.dictionary(forKey: settingsKey) ?? [:]
+        return RunContextNotificationSettings(payload: payload)
     }
 }
 
@@ -169,6 +202,11 @@ struct RunContextWebView: UIViewRepresentable {
             self.onReady = onReady
             super.init()
             UNUserNotificationCenter.current().delegate = self
+            importer.startRunningWorkoutBackgroundDelivery { [weak self] in
+                DispatchQueue.main.async {
+                    self?.handleBackgroundHealthKitChange()
+                }
+            }
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -322,6 +360,7 @@ struct RunContextWebView: UIViewRepresentable {
                 let enabled = settings["allEnabled"] as? Bool ?? false
                 let payloads = body["notifications"] as? [[String: Any]] ?? []
                 let requests = payloads.compactMap(RunContextNotificationRequest.init(payload:))
+                notificationManager.updateSettings(RunContextNotificationSettings(payload: settings))
                 notificationManager.syncScheduledNotifications(enabled: enabled, requests: requests)
             case "showNotification":
                 guard let title = body["title"] as? String,
@@ -333,6 +372,22 @@ struct RunContextWebView: UIViewRepresentable {
             default:
                 return
             }
+        }
+
+        private func handleBackgroundHealthKitChange() {
+            if UIApplication.shared.applicationState == .active {
+                requestWebHealthKitSync(reason: "background-delivery")
+                return
+            }
+            notificationManager.showHealthKitDetectedNotificationIfEnabled()
+        }
+
+        private func requestWebHealthKitSync(reason: String) {
+            guard let webView else { return }
+            let escaped = reason
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+            webView.evaluateJavaScript("window.RunContextHealthKit?.receiveHealthKitChanged('\(escaped)');")
         }
 
         func userNotificationCenter(
