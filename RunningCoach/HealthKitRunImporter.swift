@@ -68,6 +68,13 @@ struct HealthKitAvailability: Codable {
     let runningDynamics: Bool
 }
 
+struct HealthKitRunRefreshRequest {
+    let externalId: String?
+    let date: String?
+    let distanceKm: Double?
+    let durationSec: Double?
+}
+
 final class HealthKitRunImporter {
     private let healthStore = HKHealthStore()
     private struct HeartRatePoint {
@@ -112,15 +119,10 @@ final class HealthKitRunImporter {
         }
     }
 
-    func fetchRunningWorkout(externalId: String, completion: @escaping (Result<HealthKitRunCandidate, Error>) -> Void) {
+    func fetchRunningWorkout(request: HealthKitRunRefreshRequest, completion: @escaping (Result<HealthKitRunCandidate, Error>) -> Void) {
         guard HKHealthStore.isHealthDataAvailable() else {
             print("[RunContext HealthKit] Health data unavailable")
             completion(.failure(HealthKitImportError.healthDataUnavailable))
-            return
-        }
-
-        guard let uuid = UUID(uuidString: externalId) else {
-            completion(.failure(HealthKitImportError.invalidExternalId))
             return
         }
 
@@ -128,7 +130,7 @@ final class HealthKitRunImporter {
             switch result {
             case .success:
                 print("[RunContext HealthKit] authorization success")
-                self?.queryRunningWorkout(uuid: uuid, completion: completion)
+                self?.queryRunningWorkoutForRefresh(request: request, completion: completion)
             case .failure(let error):
                 print("[RunContext HealthKit] authorization failed:", error.localizedDescription)
                 completion(.failure(error))
@@ -217,6 +219,90 @@ final class HealthKitRunImporter {
         }
 
         healthStore.execute(query)
+    }
+
+    private func queryRunningWorkoutForRefresh(request: HealthKitRunRefreshRequest, completion: @escaping (Result<HealthKitRunCandidate, Error>) -> Void) {
+        if let externalId = request.externalId, let uuid = UUID(uuidString: externalId) {
+            queryRunningWorkout(uuid: uuid) { [weak self] result in
+                switch result {
+                case .success:
+                    completion(result)
+                case .failure(let error):
+                    if let importError = error as? HealthKitImportError,
+                       case .workoutNotFound = importError {
+                        self?.queryMatchingRunningWorkout(request: request, completion: completion)
+                    } else {
+                        completion(.failure(error))
+                    }
+                }
+            }
+            return
+        }
+
+        queryMatchingRunningWorkout(request: request, completion: completion)
+    }
+
+    private func queryMatchingRunningWorkout(request: HealthKitRunRefreshRequest, completion: @escaping (Result<HealthKitRunCandidate, Error>) -> Void) {
+        guard let dateText = request.date,
+              let date = Self.dayFormatter.date(from: dateText) else {
+            completion(.failure(HealthKitImportError.invalidExternalId))
+            return
+        }
+
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: date)
+        guard let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay) else {
+            completion(.failure(HealthKitImportError.workoutNotFound))
+            return
+        }
+
+        let datePredicate = HKQuery.predicateForSamples(withStart: startOfDay, end: endOfDay, options: [])
+        let runningPredicate = HKQuery.predicateForWorkouts(with: .running)
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [datePredicate, runningPredicate])
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+
+        let query = HKSampleQuery(sampleType: HKObjectType.workoutType(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samples, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            let workouts = (samples as? [HKWorkout]) ?? []
+            guard let workout = self?.bestMatchingWorkout(from: workouts, request: request) else {
+                completion(.failure(HealthKitImportError.workoutNotFound))
+                return
+            }
+
+            self?.buildCandidate(from: workout) { candidate in
+                completion(.success(candidate))
+            }
+        }
+
+        healthStore.execute(query)
+    }
+
+    private func bestMatchingWorkout(from workouts: [HKWorkout], request: HealthKitRunRefreshRequest) -> HKWorkout? {
+        guard !workouts.isEmpty else { return nil }
+
+        return workouts
+            .map { workout in
+                let distanceKm = workoutDistanceKm(workout)
+                let distanceScore = matchScore(actual: distanceKm, expected: request.distanceKm, tolerance: 0.08, scale: 0.04)
+                let durationScore = matchScore(actual: workout.duration, expected: request.durationSec, tolerance: 90, scale: 30)
+                return (workout: workout, score: distanceScore + durationScore)
+            }
+            .filter { $0.score.isFinite }
+            .sorted { $0.score < $1.score }
+            .first?
+            .workout
+    }
+
+    private func matchScore(actual: Double?, expected: Double?, tolerance: Double, scale: Double) -> Double {
+        guard let expected else { return 0 }
+        guard let actual else { return Double.infinity }
+        let diff = abs(actual - expected)
+        guard diff <= tolerance else { return Double.infinity }
+        return diff / max(scale, 0.0001)
     }
 
     private func buildCandidates(from workouts: [HKWorkout], completion: @escaping (Result<[HealthKitRunCandidate], Error>) -> Void) {

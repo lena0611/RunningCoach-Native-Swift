@@ -120,13 +120,24 @@ struct RunContextWebView: UIViewRepresentable {
                 }
 
             case "requestRunningWorkoutByExternalId":
-                guard let externalId = body["externalId"] as? String, !externalId.isEmpty else {
-                    sendRunUpdateError(externalId: nil, message: "HealthKit 원본 ID가 없습니다.")
+                let externalId = body["externalId"] as? String
+                let date = body["date"] as? String
+                let distanceKm = numberValue(body["distanceKm"])
+                let durationSec = numberValue(body["durationSec"])
+                let request = HealthKitRunRefreshRequest(
+                    externalId: externalId?.isEmpty == false ? externalId : nil,
+                    date: date,
+                    distanceKm: distanceKm,
+                    durationSec: durationSec
+                )
+
+                if request.externalId == nil && (request.date == nil || request.distanceKm == nil) {
+                    sendRunUpdateError(externalId: nil, message: "HealthKit 갱신에 필요한 세션 식별 정보가 부족합니다.")
                     return
                 }
 
-                print("[RunContext HealthKit] requestRunningWorkoutByExternalId externalId=\(externalId)")
-                importer.fetchRunningWorkout(externalId: externalId) { [weak self] result in
+                print("[RunContext HealthKit] requestRunningWorkoutByExternalId externalId=\(request.externalId ?? "fallback") date=\(request.date ?? "-")")
+                importer.fetchRunningWorkout(request: request) { [weak self] result in
                     DispatchQueue.main.async {
                         switch result {
                         case .success(let candidate):
@@ -134,7 +145,7 @@ struct RunContextWebView: UIViewRepresentable {
                             self?.sendRunUpdate(candidate)
                         case .failure(let error):
                             print("[RunContext HealthKit] refresh failed:", error.localizedDescription)
-                            self?.sendRunUpdateError(externalId: externalId, message: error.localizedDescription)
+                            self?.sendRunUpdateError(externalId: request.externalId, message: error.localizedDescription)
                         }
                     }
                 }
@@ -142,6 +153,19 @@ struct RunContextWebView: UIViewRepresentable {
             default:
                 sendError("지원하지 않는 HealthKit 요청입니다.")
             }
+        }
+
+        private func numberValue(_ value: Any?) -> Double? {
+            if let value = value as? Double {
+                return value
+            }
+            if let value = value as? Int {
+                return Double(value)
+            }
+            if let value = value as? NSNumber {
+                return value.doubleValue
+            }
+            return nil
         }
 
         private func handleHapticsMessage(_ message: WKScriptMessage) {
