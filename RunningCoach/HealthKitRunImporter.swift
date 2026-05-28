@@ -655,19 +655,15 @@ final class HealthKitRunImporter {
     }
 
     private func routeElevation(from locations: [CLLocation]) -> (gain: Double?, loss: Double?) {
-        guard locations.count >= 2 else { return (nil, nil) }
+        let validLocations = locations.filter { $0.verticalAccuracy >= 0 && $0.altitude.isFinite }
+        guard validLocations.count >= 2 else { return (nil, nil) }
 
         var gain = 0.0
         var loss = 0.0
-        var previous: CLLocation?
+        var previous = validLocations[0]
 
-        for location in locations where location.verticalAccuracy >= 0 {
-            guard let last = previous else {
-                previous = location
-                continue
-            }
-
-            let delta = location.altitude - last.altitude
+        for location in validLocations.dropFirst() {
+            let delta = location.altitude - previous.altitude
             previous = location
             guard abs(delta) >= 0.5, abs(delta) <= 80 else { continue }
 
@@ -678,7 +674,6 @@ final class HealthKitRunImporter {
             }
         }
 
-        guard gain > 0 || loss > 0 else { return (nil, nil) }
         return (Self.rounded(gain), Self.rounded(loss))
     }
 
