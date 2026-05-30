@@ -52,6 +52,11 @@ private final class RunContextNotificationManager {
             "healthKitNewRun": settings.healthKitNewRun
         ], forKey: settingsKey)
         print("[RunContext Notifications] settings updated all=\(settings.allEnabled) healthKit=\(settings.healthKitNewRun)")
+        if UIApplication.shared.applicationState == .active {
+            pendingHealthKitDetectedAt = nil
+            print("[RunContext Notifications] pending HealthKit detected notification discarded while app active")
+            return
+        }
         showPendingHealthKitDetectedNotificationIfNeeded(settings: settings)
     }
 
@@ -426,6 +431,10 @@ struct RunContextWebView: UIViewRepresentable {
             willPresent notification: UNNotification,
             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
         ) {
+            if notification.request.identifier.hasPrefix("pacelab-healthkit-detected-") {
+                completionHandler([])
+                return
+            }
             completionHandler([.banner, .sound, .list])
         }
 
