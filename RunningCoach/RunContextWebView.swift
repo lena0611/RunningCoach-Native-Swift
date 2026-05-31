@@ -289,14 +289,39 @@ struct RunContextWebView: UIViewRepresentable {
                     }
                 }
 
+            case "requestRunningWorkoutsInRange":
+                guard let startDate = body["startDate"] as? String,
+                      let endDate = body["endDate"] as? String else {
+                    sendError("HealthKit 조회 날짜 범위가 부족합니다.")
+                    return
+                }
+
+                print("[RunContext HealthKit] requestRunningWorkoutsInRange startDate=\(startDate) endDate=\(endDate)")
+                importer.fetchRunningWorkouts(startDate: startDate, endDate: endDate) { [weak self] result in
+                    DispatchQueue.main.async {
+                        switch result {
+                        case .success(let candidates):
+                            print("[RunContext HealthKit] fetched range candidates=\(candidates.count)")
+                            self?.sendRuns(candidates)
+                        case .failure(let error):
+                            print("[RunContext HealthKit] range failed:", error.localizedDescription)
+                            self?.sendError(error.localizedDescription)
+                        }
+                    }
+                }
+
             case "requestRunningWorkoutByExternalId":
                 let externalId = body["externalId"] as? String
                 let date = body["date"] as? String
+                let startAt = body["startAt"] as? String
+                let endAt = body["endAt"] as? String
                 let distanceKm = numberValue(body["distanceKm"])
                 let durationSec = numberValue(body["durationSec"])
                 let request = HealthKitRunRefreshRequest(
                     externalId: externalId?.isEmpty == false ? externalId : nil,
                     date: date,
+                    startAt: startAt?.isEmpty == false ? startAt : nil,
+                    endAt: endAt?.isEmpty == false ? endAt : nil,
                     distanceKm: distanceKm,
                     durationSec: durationSec
                 )

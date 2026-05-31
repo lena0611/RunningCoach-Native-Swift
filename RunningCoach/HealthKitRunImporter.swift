@@ -71,6 +71,8 @@ struct HealthKitAvailability: Codable {
 struct HealthKitRunRefreshRequest {
     let externalId: String?
     let date: String?
+    let startAt: String?
+    let endAt: String?
     let distanceKm: Double?
     let durationSec: Double?
 }
@@ -114,6 +116,25 @@ final class HealthKitRunImporter {
             case .success:
                 print("[RunContext HealthKit] authorization success")
                 self?.queryRecentRunningWorkouts(days: days, completion: completion)
+            case .failure(let error):
+                print("[RunContext HealthKit] authorization failed:", error.localizedDescription)
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func fetchRunningWorkouts(startDate: String, endDate: String, completion: @escaping (Result<[HealthKitRunCandidate], Error>) -> Void) {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            print("[RunContext HealthKit] Health data unavailable")
+            completion(.failure(HealthKitImportError.healthDataUnavailable))
+            return
+        }
+
+        requestAuthorization { [weak self] result in
+            switch result {
+            case .success:
+                print("[RunContext HealthKit] authorization success")
+                self?.queryRunningWorkouts(startDate: startDate, endDate: endDate, completion: completion)
             case .failure(let error):
                 print("[RunContext HealthKit] authorization failed:", error.localizedDescription)
                 completion(.failure(error))
@@ -245,6 +266,41 @@ final class HealthKitRunImporter {
         healthStore.execute(query)
     }
 
+    private func queryRunningWorkouts(startDate startDateText: String, endDate endDateText: String, completion: @escaping (Result<[HealthKitRunCandidate], Error>) -> Void) {
+        guard let startDay = Self.dayFormatter.date(from: startDateText),
+              let endDay = Self.dayFormatter.date(from: endDateText) else {
+            completion(.failure(HealthKitImportError.invalidDateRange))
+            return
+        }
+
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: startDay)
+        let endStartOfDay = calendar.startOfDay(for: endDay)
+        guard let endExclusive = calendar.date(byAdding: .day, value: 1, to: endStartOfDay),
+              startOfDay < endExclusive else {
+            completion(.failure(HealthKitImportError.invalidDateRange))
+            return
+        }
+
+        let datePredicate = HKQuery.predicateForSamples(withStart: startOfDay, end: endExclusive, options: [])
+        let runningPredicate = HKQuery.predicateForWorkouts(with: .running)
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [datePredicate, runningPredicate])
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)
+
+        let query = HKSampleQuery(sampleType: HKObjectType.workoutType(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samples, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            let workouts = (samples as? [HKWorkout]) ?? []
+            print("[RunContext HealthKit] workouts in range=\(workouts.count)")
+            self?.buildCandidates(from: workouts, completion: completion)
+        }
+
+        healthStore.execute(query)
+    }
+
     private func queryRunningWorkout(uuid: UUID, completion: @escaping (Result<HealthKitRunCandidate, Error>) -> Void) {
         let objectPredicate = HKQuery.predicateForObject(with: uuid)
         let runningPredicate = HKQuery.predicateForWorkouts(with: .running)
@@ -337,7 +393,9 @@ final class HealthKitRunImporter {
                 let distanceKm = workoutDistanceKm(workout)
                 let distanceScore = matchScore(actual: distanceKm, expected: request.distanceKm, tolerance: 0.08, scale: 0.04)
                 let durationScore = matchScore(actual: workout.duration, expected: request.durationSec, tolerance: 90, scale: 30)
-                return (workout: workout, score: distanceScore + durationScore)
+                let startScore = matchDateScore(actual: workout.startDate, expected: request.startAt, tolerance: 180, scale: 60)
+                let endScore = matchDateScore(actual: workout.endDate, expected: request.endAt, tolerance: 180, scale: 60)
+                return (workout: workout, score: distanceScore + durationScore + startScore + endScore)
             }
             .filter { $0.score.isFinite }
             .sorted { $0.score < $1.score }
@@ -349,6 +407,13 @@ final class HealthKitRunImporter {
         guard let expected else { return 0 }
         guard let actual else { return Double.infinity }
         let diff = abs(actual - expected)
+        guard diff <= tolerance else { return Double.infinity }
+        return diff / max(scale, 0.0001)
+    }
+
+    private func matchDateScore(actual: Date, expected: String?, tolerance: TimeInterval, scale: TimeInterval) -> Double {
+        guard let expected, let expectedDate = Self.isoFormatter.date(from: expected) else { return 0 }
+        let diff = abs(actual.timeIntervalSince(expectedDate))
         guard diff <= tolerance else { return Double.infinity }
         return diff / max(scale, 0.0001)
     }
@@ -1064,6 +1129,7 @@ enum HealthKitImportError: LocalizedError {
     case healthDataUnavailable
     case authorizationDenied
     case invalidExternalId
+    case invalidDateRange
     case workoutNotFound
 
     var errorDescription: String? {
@@ -1074,6 +1140,8 @@ enum HealthKitImportError: LocalizedError {
             return "HealthKit 권한이 허용되지 않았습니다."
         case .invalidExternalId:
             return "HealthKit 원본 ID 형식이 올바르지 않습니다."
+        case .invalidDateRange:
+            return "HealthKit 조회 날짜 범위가 올바르지 않습니다."
         case .workoutNotFound:
             return "HealthKit에서 해당 러닝 세션을 찾지 못했습니다."
         }
