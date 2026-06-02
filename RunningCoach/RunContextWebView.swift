@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import UserNotifications
 import WebKit
+import DeviceCheck
 
 final class RunContextWKWebView: WKWebView {
     override var inputAccessoryView: UIView? {
@@ -177,6 +178,7 @@ struct RunContextWebView: UIViewRepresentable {
         contentController.add(context.coordinator, name: "runContextWeatherKit")
         contentController.add(context.coordinator, name: "runContextHaptics")
         contentController.add(context.coordinator, name: "runContextNotifications")
+        contentController.add(context.coordinator, name: "runContextAppSecurity")
         contentController.add(context.coordinator, name: "runContextLog")
         contentController.addUserScript(WKUserScript(
             source: """
@@ -204,7 +206,11 @@ struct RunContextWebView: UIViewRepresentable {
         webView.scrollView.contentInset = .zero
         webView.scrollView.scrollIndicatorInsets = .zero
         if #available(iOS 16.4, *) {
+            #if DEBUG
             webView.isInspectable = true
+            #else
+            webView.isInspectable = false
+            #endif
         }
         loadWebApp(in: webView)
         return webView
@@ -245,8 +251,18 @@ struct RunContextWebView: UIViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard isTrustedMessage(message) else {
+                print("[RunContext WebView] blocked untrusted bridge message:", message.name)
+                return
+            }
+
             if message.name == "runContextLog" {
                 print("[RunContext WebView]", message.body)
+                return
+            }
+
+            if message.name == "runContextAppSecurity" {
+                handleAppSecurityMessage(message)
                 return
             }
 
@@ -347,6 +363,35 @@ struct RunContextWebView: UIViewRepresentable {
 
             default:
                 sendError("지원하지 않는 HealthKit 요청입니다.")
+            }
+        }
+
+        private func handleAppSecurityMessage(_ message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any],
+                  let type = body["type"] as? String,
+                  type == "requestDeviceCheckToken" else {
+                sendAppSecurityError("지원하지 않는 앱 실행 검증 요청입니다.")
+                return
+            }
+
+            guard DCDevice.current.isSupported else {
+                sendAppSecurityError("이 기기는 DeviceCheck를 지원하지 않습니다.")
+                return
+            }
+
+            DCDevice.current.generateToken { [weak self] data, error in
+                DispatchQueue.main.async {
+                    if let error {
+                        print("[RunContext AppSecurity] DeviceCheck failed:", error.localizedDescription)
+                        self?.sendAppSecurityError(error.localizedDescription)
+                        return
+                    }
+                    guard let data else {
+                        self?.sendAppSecurityError("DeviceCheck 토큰이 비어 있습니다.")
+                        return
+                    }
+                    self?.sendDeviceCheckToken(data.base64EncodedString())
+                }
             }
         }
 
@@ -490,6 +535,19 @@ struct RunContextWebView: UIViewRepresentable {
             loadDiagnosticPage(in: webView, reason: "초기 페이지 로딩 실패: \(error.localizedDescription)")
         }
 
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            guard navigationAction.targetFrame?.isMainFrame != true else {
+                if let url = navigationAction.request.url, isTrustedWebAppURL(url) {
+                    decisionHandler(.allow)
+                    return
+                }
+                print("[RunContext WebView] blocked navigation:", navigationAction.request.url?.absoluteString ?? "unknown")
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+
         private func sendRuns(_ candidates: [HealthKitRunCandidate]) {
             guard let webView else { return }
             do {
@@ -525,33 +583,62 @@ struct RunContextWebView: UIViewRepresentable {
 
         private func sendWeatherError(_ message: String) {
             guard let webView else { return }
-            let escaped = message
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "'", with: "\\'")
-                .replacingOccurrences(of: "\n", with: "\\n")
+            let escaped = escapeJavaScriptString(message)
             webView.evaluateJavaScript("window.RunContextWeatherKit?.receiveError('\(escaped)');")
+        }
+
+        private func sendDeviceCheckToken(_ token: String) {
+            guard let webView else { return }
+            let escaped = escapeJavaScriptString(token)
+            webView.evaluateJavaScript("window.PaceLabAppSecurity?.receiveDeviceCheckToken('\(escaped)');")
+        }
+
+        private func sendAppSecurityError(_ message: String) {
+            guard let webView else { return }
+            let escaped = escapeJavaScriptString(message)
+            webView.evaluateJavaScript("window.PaceLabAppSecurity?.receiveError('\(escaped)');")
         }
 
         private func sendError(_ message: String) {
             guard let webView else { return }
-            let escaped = message
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "'", with: "\\'")
-                .replacingOccurrences(of: "\n", with: "\\n")
+            let escaped = escapeJavaScriptString(message)
             webView.evaluateJavaScript("window.RunContextHealthKit?.receiveError('\(escaped)');")
         }
 
         private func sendRunUpdateError(externalId: String?, message: String) {
             guard let webView else { return }
-            let escapedId = (externalId ?? "")
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "'", with: "\\'")
-                .replacingOccurrences(of: "\n", with: "\\n")
-            let escapedMessage = message
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "'", with: "\\'")
-                .replacingOccurrences(of: "\n", with: "\\n")
+            let escapedId = escapeJavaScriptString(externalId ?? "")
+            let escapedMessage = escapeJavaScriptString(message)
             webView.evaluateJavaScript("window.RunContextHealthKit?.receiveRunUpdateError('\(escapedId)', '\(escapedMessage)');")
+        }
+
+        private func isTrustedMessage(_ message: WKScriptMessage) -> Bool {
+            guard message.name != "runContextLog" else { return true }
+            let origin = message.frameInfo.securityOrigin
+            guard origin.protocol == "https",
+                  origin.host == "lena0611.github.io",
+                  origin.port == 0 || origin.port == 443 else {
+                return false
+            }
+            return true
+        }
+
+        private func isTrustedWebAppURL(_ url: URL) -> Bool {
+            if url.scheme == "about" && url.absoluteString == "about:blank" {
+                return true
+            }
+            guard url.scheme == "https",
+                  url.host == "lena0611.github.io" else {
+                return false
+            }
+            return url.path == "/RunningCoach/" || url.path == "/RunningCoach"
+        }
+
+        private func escapeJavaScriptString(_ value: String) -> String {
+            value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+                .replacingOccurrences(of: "\n", with: "\\n")
         }
 
         private func loadDiagnosticPage(in webView: WKWebView, reason: String) {
