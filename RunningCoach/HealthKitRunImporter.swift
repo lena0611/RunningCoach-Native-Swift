@@ -631,14 +631,29 @@ final class HealthKitRunImporter {
     }
 
     private func queryStepSamples(for workout: HKWorkout, stepType: HKQuantityType, completion: @escaping ([StepPoint]) -> Void) {
+        // 케이던스는 step count 기반이다. 원시 표본(HKSampleQuery)을 그대로 합산하면
+        // 시간상 겹치는 표본이 중복 계산되어 케이던스가 부풀려진다(평균 167→284, 버킷 폭주).
+        // Apple Fitness와 동일하게 cumulativeSum 통계로 고정 구간 합을 구해 중복을 정리하고
+        // 각 표본 count를 구간에 비례 분배한다. 5초 구간은 케이던스 버킷/랩 경계 오차를 무시할 수준으로 만든다.
         let predicate = HKQuery.predicateForObjects(from: workout)
-        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-        let query = HKSampleQuery(sampleType: stepType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, _ in
-            let points = (samples as? [HKQuantitySample] ?? []).map {
-                StepPoint(
-                    startDate: $0.startDate,
-                    endDate: $0.endDate,
-                    count: $0.quantity.doubleValue(for: .count())
+        let interval = DateComponents(second: 5)
+        let query = HKStatisticsCollectionQuery(
+            quantityType: stepType,
+            quantitySamplePredicate: predicate,
+            options: .cumulativeSum,
+            anchorDate: workout.startDate,
+            intervalComponents: interval
+        )
+        query.initialResultsHandler = { _, results, _ in
+            var points: [StepPoint] = []
+            results?.enumerateStatistics(from: workout.startDate, to: workout.endDate) { statistics, _ in
+                guard let sum = statistics.sumQuantity()?.doubleValue(for: .count()), sum > 0 else { return }
+                points.append(
+                    StepPoint(
+                        startDate: statistics.startDate,
+                        endDate: statistics.endDate,
+                        count: sum
+                    )
                 )
             }
             completion(points)
@@ -1089,11 +1104,20 @@ final class HealthKitRunImporter {
     }
 
     private func averageCadence(_ points: [StepPoint], from start: Date, to end: Date) -> Double? {
-        let totalSteps = points
-            .filter { $0.endDate >= start && $0.startDate <= end }
-            .reduce(0) { $0 + max($1.count, 0) }
         let durationMin = end.timeIntervalSince(start) / 60
-        guard totalSteps > 0, durationMin > 0 else { return nil }
+        guard durationMin > 0 else { return nil }
+        // 각 step 구간이 [start, end]와 겹치는 비율만큼만 더한다.
+        // (구간보다 긴 표본의 count를 전량 더해 짧은 분모로 나누던 폭주 버그 방지)
+        let totalSteps = points.reduce(0.0) { partial, point in
+            let overlapStart = max(point.startDate, start)
+            let overlapEnd = min(point.endDate, end)
+            let overlap = overlapEnd.timeIntervalSince(overlapStart)
+            guard overlap > 0 else { return partial }
+            let sampleDuration = point.endDate.timeIntervalSince(point.startDate)
+            let fraction = sampleDuration > 0 ? overlap / sampleDuration : 1
+            return partial + max(point.count, 0) * fraction
+        }
+        guard totalSteps > 0 else { return nil }
         return Self.rounded(totalSteps / durationMin)
     }
 
