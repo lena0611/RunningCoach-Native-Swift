@@ -1,0 +1,13 @@
+#!/bin/sh
+# 하네스 경량 안전장치: main 직접 push 차단.
+if [ "$HARNESS_ALLOW_MAIN_PUSH" = "1" ]; then exit 0; fi
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main)
+      echo "[harness] main 직접 push 차단. feature branch를 push하고 PR로 머지하세요." >&2
+      echo "[harness] 예외: HARNESS_ALLOW_MAIN_PUSH=1 git push ..." >&2
+      exit 1
+      ;;
+  esac
+done
+exit 0

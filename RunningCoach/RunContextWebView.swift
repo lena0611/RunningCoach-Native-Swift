@@ -1,3 +1,4 @@
+import Security
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -177,6 +178,7 @@ struct RunContextWebView: UIViewRepresentable {
         contentController.add(context.coordinator, name: "runContextWeatherKit")
         contentController.add(context.coordinator, name: "runContextHaptics")
         contentController.add(context.coordinator, name: "runContextNotifications")
+        contentController.add(context.coordinator, name: "runContextAuth")
         contentController.add(context.coordinator, name: "runContextLog")
         contentController.addUserScript(WKUserScript(
             source: """
@@ -203,6 +205,13 @@ struct RunContextWebView: UIViewRepresentable {
         webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.scrollView.contentInset = .zero
         webView.scrollView.scrollIndicatorInsets = .zero
+        webView.scrollView.minimumZoomScale = 1
+        webView.scrollView.maximumZoomScale = 1
+        webView.scrollView.pinchGestureRecognizer?.isEnabled = false
+        webView.scrollView.gestureRecognizers?
+            .compactMap { $0 as? UITapGestureRecognizer }
+            .filter { $0.numberOfTapsRequired >= 2 }
+            .forEach { $0.isEnabled = false }
         if #available(iOS 16.4, *) {
             webView.isInspectable = true
         }
@@ -262,6 +271,11 @@ struct RunContextWebView: UIViewRepresentable {
 
             if message.name == "runContextNotifications" {
                 handleNotificationMessage(message)
+                return
+            }
+
+            if message.name == "runContextAuth" {
+                handleAuthMessage(message)
                 return
             }
 
@@ -341,6 +355,21 @@ struct RunContextWebView: UIViewRepresentable {
                         case .failure(let error):
                             print("[RunContext HealthKit] refresh failed:", error.localizedDescription)
                             self?.sendRunUpdateError(externalId: request.externalId, message: error.localizedDescription)
+                        }
+                    }
+                }
+
+            case "requestLatestVo2Max":
+                print("[RunContext HealthKit] requestLatestVo2Max")
+                importer.fetchLatestVo2Max { [weak self] result in
+                    DispatchQueue.main.async {
+                        switch result {
+                        case .success(let sample):
+                            print("[RunContext HealthKit] vo2max value=\(sample.value.map { String($0) } ?? "nil")")
+                            self?.sendVo2Max(sample)
+                        case .failure(let error):
+                            print("[RunContext HealthKit] vo2max failed:", error.localizedDescription)
+                            self?.sendVo2MaxError(error.localizedDescription)
                         }
                     }
                 }
@@ -435,6 +464,51 @@ struct RunContextWebView: UIViewRepresentable {
             }
         }
 
+        private func handleAuthMessage(_ message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any],
+                  let type = body["type"] as? String else {
+                return
+            }
+
+            switch type {
+            case "saveSession":
+                guard let accessToken = body["accessToken"] as? String, !accessToken.isEmpty,
+                      let refreshToken = body["refreshToken"] as? String, !refreshToken.isEmpty else {
+                    print("[RunContext Auth] saveSession ignored: empty token")
+                    return
+                }
+                RunContextAuthKeychain.save(accessToken: accessToken, refreshToken: refreshToken)
+                print("[RunContext Auth] saveSession stored to Keychain")
+            case "clearSession":
+                RunContextAuthKeychain.clear()
+                print("[RunContext Auth] clearSession removed Keychain item")
+            case "requestStoredSession":
+                print("[RunContext Auth] requestStoredSession received")
+                sendStoredSession()
+            default:
+                print("[RunContext Auth] unsupported type=\(type)")
+                return
+            }
+        }
+
+        private func sendStoredSession() {
+            guard let webView else { return }
+            let payload: String
+            if let stored = RunContextAuthKeychain.load(),
+               let data = try? JSONSerialization.data(withJSONObject: [
+                   "accessToken": stored.accessToken,
+                   "refreshToken": stored.refreshToken
+               ]),
+               let json = String(data: data, encoding: .utf8) {
+                payload = json
+                print("[RunContext Auth] sendStoredSession: Keychain hit, restoring session")
+            } else {
+                payload = "null"
+                print("[RunContext Auth] sendStoredSession: Keychain miss, no stored session")
+            }
+            webView.evaluateJavaScript("window.RunContextAuth?.receiveStoredSession(\(payload));")
+        }
+
         private func handleBackgroundHealthKitChange() {
             if UIApplication.shared.applicationState == .active {
                 requestWebHealthKitSync(reason: "background-delivery")
@@ -510,6 +584,26 @@ struct RunContextWebView: UIViewRepresentable {
             } catch {
                 sendRunUpdateError(externalId: candidate.externalId, message: "HealthKit 갱신 응답 직렬화 실패")
             }
+        }
+
+        private func sendVo2Max(_ sample: HealthKitVo2MaxSample) {
+            guard let webView else { return }
+            do {
+                let data = try JSONEncoder().encode(sample)
+                let json = String(data: data, encoding: .utf8) ?? "{}"
+                webView.evaluateJavaScript("window.RunContextHealthKit?.receiveVo2Max(\(json));")
+            } catch {
+                sendVo2MaxError("HealthKit VO2max 응답 직렬화 실패")
+            }
+        }
+
+        private func sendVo2MaxError(_ message: String) {
+            guard let webView else { return }
+            let escaped = message
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+                .replacingOccurrences(of: "\n", with: "\\n")
+            webView.evaluateJavaScript("window.RunContextHealthKit?.receiveVo2MaxError('\(escaped)');")
         }
 
         private func sendWeatherForecast(_ snapshot: RunContextWeatherSnapshot) {
@@ -591,5 +685,76 @@ struct RunContextWebView: UIViewRepresentable {
                 onReady()
             }
         }
+    }
+}
+
+/// Supabase 세션(refresh/access token)을 iOS Keychain에 보관한다.
+///
+/// WKWebView의 localStorage는 앱 삭제 시 함께 사라지지만 Keychain 항목은 재설치 후에도
+/// 남기 때문에, 한 번 인증한 기기에서는 OTP 재입력 없이 세션을 복원할 수 있다.
+/// `ThisDeviceOnly` 접근성으로 iCloud Keychain 동기화는 막아 토큰을 기기 로컬로 한정한다.
+enum RunContextAuthKeychain {
+    struct StoredSession {
+        let accessToken: String
+        let refreshToken: String
+    }
+
+    private static let service = "kr.smartscore.pacelab.auth"
+    private static let account = "supabase-session"
+
+    static func save(accessToken: String, refreshToken: String) {
+        let payload: [String: String] = [
+            "accessToken": accessToken,
+            "refreshToken": refreshToken
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var insert = query
+            insert[kSecValueData as String] = data
+            insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemAdd(insert as CFDictionary, nil)
+        }
+    }
+
+    static func load() -> StoredSession? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let accessToken = object["accessToken"], !accessToken.isEmpty,
+              let refreshToken = object["refreshToken"], !refreshToken.isEmpty else {
+            return nil
+        }
+        return StoredSession(accessToken: accessToken, refreshToken: refreshToken)
+    }
+
+    static func clear() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 }

@@ -77,6 +77,14 @@ struct HealthKitRunRefreshRequest {
     let durationSec: Double?
 }
 
+// VO2max(심폐 체력)는 워크아웃에 묶이지 않는 프로필 레벨 최신 샘플이라 러닝 후보와 분리해 전달한다.
+struct HealthKitVo2MaxSample: Codable {
+    let value: Double?
+    let unit: String?
+    let sampleDate: String?
+    let sourceName: String?
+}
+
 final class HealthKitRunImporter {
     private let healthStore = HKHealthStore()
     private var runningWorkoutObserverQuery: HKObserverQuery?
@@ -161,6 +169,53 @@ final class HealthKitRunImporter {
         }
     }
 
+    func fetchLatestVo2Max(completion: @escaping (Result<HealthKitVo2MaxSample, Error>) -> Void) {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            print("[RunContext HealthKit] Health data unavailable")
+            completion(.failure(HealthKitImportError.healthDataUnavailable))
+            return
+        }
+
+        requestAuthorization { [weak self] result in
+            switch result {
+            case .success:
+                print("[RunContext HealthKit] authorization success (vo2max)")
+                self?.queryLatestVo2Max(completion: completion)
+            case .failure(let error):
+                print("[RunContext HealthKit] authorization failed (vo2max):", error.localizedDescription)
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func queryLatestVo2Max(completion: @escaping (Result<HealthKitVo2MaxSample, Error>) -> Void) {
+        guard let vo2Type = HKObjectType.quantityType(forIdentifier: .vo2Max) else {
+            completion(.failure(HealthKitImportError.healthDataUnavailable))
+            return
+        }
+        // 최신 샘플 1건만. 워크아웃과 무관하므로 predicate 없이 endDate 내림차순으로 정렬한다.
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
+        let query = HKSampleQuery(sampleType: vo2Type, predicate: nil, limit: 1, sortDescriptors: [sort]) { _, samples, error in
+            if let error {
+                print("[RunContext HealthKit] vo2max query failed:", error.localizedDescription)
+                completion(.failure(error))
+                return
+            }
+            guard let sample = samples?.first as? HKQuantitySample else {
+                // 기록 없음은 오류가 아니다. value=nil로 정상 응답해 웹이 "미사용"으로 처리한다.
+                completion(.success(HealthKitVo2MaxSample(value: nil, unit: nil, sampleDate: nil, sourceName: nil)))
+                return
+            }
+            let unit = HKUnit(from: "mL/kg*min")
+            let raw = sample.quantity.doubleValue(for: unit)
+            let value = (raw * 10).rounded() / 10
+            let sampleDate = Self.isoFormatter.string(from: sample.endDate)
+            let sourceName = sample.sourceRevision.source.name
+            completion(.success(HealthKitVo2MaxSample(value: value, unit: "mL/kg·min", sampleDate: sampleDate, sourceName: sourceName)))
+        }
+        healthStore.execute(query)
+    }
+
     func startRunningWorkoutBackgroundDelivery(onChange: @escaping () -> Void) {
         guard HKHealthStore.isHealthDataAvailable() else {
             print("[RunContext HealthKit] Background delivery unavailable: health data unavailable")
@@ -205,7 +260,8 @@ final class HealthKitRunImporter {
             HKQuantityTypeIdentifier.runningSpeed,
             HKQuantityTypeIdentifier.runningPower,
             HKQuantityTypeIdentifier.runningStrideLength,
-            HKQuantityTypeIdentifier.runningVerticalOscillation
+            HKQuantityTypeIdentifier.runningVerticalOscillation,
+            HKQuantityTypeIdentifier.vo2Max
         ].compactMap { HKObjectType.quantityType(forIdentifier: $0) }
             .forEach { types.append($0) }
 
@@ -631,14 +687,29 @@ final class HealthKitRunImporter {
     }
 
     private func queryStepSamples(for workout: HKWorkout, stepType: HKQuantityType, completion: @escaping ([StepPoint]) -> Void) {
+        // 케이던스는 step count 기반이다. 원시 표본(HKSampleQuery)을 그대로 합산하면
+        // 시간상 겹치는 표본이 중복 계산되어 케이던스가 부풀려진다(평균 167→284, 버킷 폭주).
+        // Apple Fitness와 동일하게 cumulativeSum 통계로 고정 구간 합을 구해 중복을 정리하고
+        // 각 표본 count를 구간에 비례 분배한다. 5초 구간은 케이던스 버킷/랩 경계 오차를 무시할 수준으로 만든다.
         let predicate = HKQuery.predicateForObjects(from: workout)
-        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-        let query = HKSampleQuery(sampleType: stepType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, _ in
-            let points = (samples as? [HKQuantitySample] ?? []).map {
-                StepPoint(
-                    startDate: $0.startDate,
-                    endDate: $0.endDate,
-                    count: $0.quantity.doubleValue(for: .count())
+        let interval = DateComponents(second: 5)
+        let query = HKStatisticsCollectionQuery(
+            quantityType: stepType,
+            quantitySamplePredicate: predicate,
+            options: .cumulativeSum,
+            anchorDate: workout.startDate,
+            intervalComponents: interval
+        )
+        query.initialResultsHandler = { _, results, _ in
+            var points: [StepPoint] = []
+            results?.enumerateStatistics(from: workout.startDate, to: workout.endDate) { statistics, _ in
+                guard let sum = statistics.sumQuantity()?.doubleValue(for: .count()), sum > 0 else { return }
+                points.append(
+                    StepPoint(
+                        startDate: statistics.startDate,
+                        endDate: statistics.endDate,
+                        count: sum
+                    )
                 )
             }
             completion(points)
@@ -1089,11 +1160,20 @@ final class HealthKitRunImporter {
     }
 
     private func averageCadence(_ points: [StepPoint], from start: Date, to end: Date) -> Double? {
-        let totalSteps = points
-            .filter { $0.endDate >= start && $0.startDate <= end }
-            .reduce(0) { $0 + max($1.count, 0) }
         let durationMin = end.timeIntervalSince(start) / 60
-        guard totalSteps > 0, durationMin > 0 else { return nil }
+        guard durationMin > 0 else { return nil }
+        // 각 step 구간이 [start, end]와 겹치는 비율만큼만 더한다.
+        // (구간보다 긴 표본의 count를 전량 더해 짧은 분모로 나누던 폭주 버그 방지)
+        let totalSteps = points.reduce(0.0) { partial, point in
+            let overlapStart = max(point.startDate, start)
+            let overlapEnd = min(point.endDate, end)
+            let overlap = overlapEnd.timeIntervalSince(overlapStart)
+            guard overlap > 0 else { return partial }
+            let sampleDuration = point.endDate.timeIntervalSince(point.startDate)
+            let fraction = sampleDuration > 0 ? overlap / sampleDuration : 1
+            return partial + max(point.count, 0) * fraction
+        }
+        guard totalSteps > 0 else { return nil }
         return Self.rounded(totalSteps / durationMin)
     }
 

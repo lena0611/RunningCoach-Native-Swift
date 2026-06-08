@@ -1,0 +1,10 @@
+#!/bin/sh
+# 하네스 경량 안전장치: main 직접 커밋 차단 (feature branch + PR 강제).
+# 무거운 빌드 검증은 하지 않는다. iOS 검증은 Xcode 재빌드/기기 설치로 분리한다.
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+if [ "$branch" = "main" ] && [ "$HARNESS_ALLOW_MAIN_COMMIT" != "1" ]; then
+  echo "[harness] main 직접 커밋 차단. feature branch에서 작업하고 PR로 머지하세요." >&2
+  echo "[harness] 예외: HARNESS_ALLOW_MAIN_COMMIT=1 git commit ..." >&2
+  exit 1
+fi
+exit 0
